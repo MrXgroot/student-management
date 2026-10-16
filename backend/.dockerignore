@@ -1,0 +1,19 @@
+# Version control and IDE files
+.git/
+.gitignore
+.vs/
+.vscode/
+*.user
+*.suo
+
+# Build output and compilation artifacts
+**/bin/
+**/obj/
+
+# Test project (not included in production API image)
+EduCore.UnitTests/
+
+# Development configuration and scratch files
+**/appsettings.Development.json
+**/*.http
+*.log
