@@ -36,28 +36,45 @@ builder.Services.Configure<MongoDbOptions>(options =>
 
 builder.Services.AddSingleton<IMongoDbContext, MongoDbContext>();
 
-// Register Domain Services (receiving shared IMongoDbContext via DI)
+// Register Domain Services
 builder.Services.AddSingleton<IStudentService, StudentService>();
 builder.Services.AddSingleton<IAcademicService, AcademicService>();
 builder.Services.AddSingleton<ITermRegistrationService, TermRegistrationService>();
 builder.Services.AddSingleton<IAttendanceService, AttendanceService>();
 builder.Services.AddSingleton<IFeeService, FeeService>();
 
-// Configure CORS for frontend access
+// Configure CORS for frontend access (supporting localhost and all Vercel previews)
 builder.Services.AddCors(options =>
 {
     options.AddPolicy("AllowFrontend", policy =>
     {
-        policy.WithOrigins("http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:3000","https://student-management-inky-gamma.vercel.app","https://student-management-lo20i2cln-sukeshachar1489-3630.vercel.app")
-              .AllowAnyHeader()
-              .AllowAnyMethod()
-              .AllowCredentials();
+        policy.SetIsOriginAllowed(origin =>
+        {
+            if (string.IsNullOrWhiteSpace(origin)) return false;
+            var uri = new Uri(origin);
+
+            // Allow localhost during local dev
+            if (uri.Host == "localhost" || uri.Host == "127.0.0.1") return true;
+
+            // Allow production Vercel app and any preview branch deployments
+            if (uri.Host == "student-management-inky-gamma.vercel.app" ||
+                uri.Host.EndsWith(".vercel.app", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            return false;
+        })
+        .AllowAnyHeader()
+        .AllowAnyMethod()
+        .AllowCredentials();
     });
 });
 
 var app = builder.Build();
 
-// Enable CORS
+// Enable routing and CORS in correct pipeline order
+app.UseRouting();
 app.UseCors("AllowFrontend");
 
 if (app.Environment.IsDevelopment())
@@ -67,7 +84,7 @@ if (app.Environment.IsDevelopment())
 
 app.MapControllers();
 
-// Health check endpoint reporting true persistence state without exposing secrets
+// Health check endpoint
 app.MapGet("/health", (IMongoDbContext dbContext) =>
 {
     var isMongoActive = dbContext.IsAvailable;
