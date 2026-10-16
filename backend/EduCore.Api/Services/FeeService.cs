@@ -1,5 +1,8 @@
 using System.Collections.Concurrent;
+using EduCore.Api.Data;
 using EduCore.Api.Models;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging.Abstractions;
 using MongoDB.Bson;
 using MongoDB.Driver;
 
@@ -18,13 +21,14 @@ public class FeeService : IFeeService
     private readonly ConcurrentDictionary<string, ProgramFeeStructure> _inMemoryStructures = new();
     private readonly ConcurrentDictionary<string, StudentFeeRecord> _inMemoryRecords = new();
     private readonly ConcurrentDictionary<string, FeePayment> _inMemoryPayments = new();
-
+    private readonly bool _allowInMemoryFallback;
     private bool _isMongoDbActive;
 
     public bool IsMongoDbActive => _isMongoDbActive;
 
+    [ActivatorUtilitiesConstructor]
     public FeeService(
-        IConfiguration config,
+        IMongoDbContext dbContext,
         IStudentService studentService,
         IAcademicService academicService,
         ILogger<FeeService> logger)
@@ -32,62 +36,62 @@ public class FeeService : IFeeService
         _logger = logger;
         _studentService = studentService;
         _academicService = academicService;
+        _isMongoDbActive = dbContext.IsAvailable;
+        _allowInMemoryFallback = dbContext.AllowInMemoryFallback;
 
-        var connectionString = config.GetConnectionString("MongoDb") ?? "mongodb://localhost:27017";
-        var databaseName = config["DatabaseName"] ?? "educore_mvp";
-
-        try
+        if (_isMongoDbActive && dbContext.Database != null)
         {
-            var settings = MongoClientSettings.FromConnectionString(connectionString);
-            settings.ServerSelectionTimeout = TimeSpan.FromSeconds(2);
-            var client = new MongoClient(settings);
-            var database = client.GetDatabase(databaseName);
+            try
+            {
+                _structureCollection = dbContext.GetCollection<ProgramFeeStructure>("programFeeStructures");
+                _recordCollection = dbContext.GetCollection<StudentFeeRecord>("studentFeeRecords");
+                _paymentCollection = dbContext.GetCollection<FeePayment>("feePayments");
 
-            _structureCollection = database.GetCollection<ProgramFeeStructure>("programFeeStructures");
-            _recordCollection = database.GetCollection<StudentFeeRecord>("studentFeeRecords");
-            _paymentCollection = database.GetCollection<FeePayment>("feePayments");
+                // 1. Program Fee Structure unique index: { ProgramCode: 1, AcademicPeriodCode: 1 }
+                var structKeys = Builders<ProgramFeeStructure>.IndexKeys
+                    .Ascending(s => s.ProgramCode)
+                    .Ascending(s => s.AcademicPeriodCode);
+                _structureCollection.Indexes.CreateOne(new CreateIndexModel<ProgramFeeStructure>(structKeys, new CreateIndexOptions { Unique = true }));
 
-            database.RunCommandAsync((Command<BsonDocument>)"{ping:1}").Wait(2500);
-            _isMongoDbActive = true;
-            _logger.LogInformation("FeeService connected to MongoDB at {Conn}, Database: {Db}", connectionString, databaseName);
+                // 2. Student Fee Record unique index: { StudentId: 1, AcademicPeriodCode: 1 }
+                var recordKeys = Builders<StudentFeeRecord>.IndexKeys
+                    .Ascending(r => r.StudentId)
+                    .Ascending(r => r.AcademicPeriodCode);
+                _recordCollection.Indexes.CreateOne(new CreateIndexModel<StudentFeeRecord>(recordKeys, new CreateIndexOptions { Unique = true }));
 
-            // 1. Program Fee Structure unique index: { ProgramCode: 1, AcademicPeriodCode: 1 }
-            var structKeys = Builders<ProgramFeeStructure>.IndexKeys
-                .Ascending(s => s.ProgramCode)
-                .Ascending(s => s.AcademicPeriodCode);
-            _structureCollection.Indexes.CreateOne(new CreateIndexModel<ProgramFeeStructure>(structKeys, new CreateIndexOptions { Unique = true }));
+                // 3. Fee Payment unique receipt index: { ReceiptNumber: 1 }
+                var receiptKeys = Builders<FeePayment>.IndexKeys.Ascending(p => p.ReceiptNumber);
+                _paymentCollection.Indexes.CreateOne(new CreateIndexModel<FeePayment>(receiptKeys, new CreateIndexOptions { Unique = true }));
 
-            // 2. Student Fee Record unique index: { StudentId: 1, AcademicPeriodCode: 1 }
-            var recordKeys = Builders<StudentFeeRecord>.IndexKeys
-                .Ascending(r => r.StudentId)
-                .Ascending(r => r.AcademicPeriodCode);
-            _recordCollection.Indexes.CreateOne(new CreateIndexModel<StudentFeeRecord>(recordKeys, new CreateIndexOptions { Unique = true }));
-
-            // 3. Fee Payment unique receipt index: { ReceiptNumber: 1 }
-            var receiptKeys = Builders<FeePayment>.IndexKeys.Ascending(p => p.ReceiptNumber);
-            _paymentCollection.Indexes.CreateOne(new CreateIndexModel<FeePayment>(receiptKeys, new CreateIndexOptions { Unique = true }));
-
-            // 4. Payment student index
-            var paymentStudentKeys = Builders<FeePayment>.IndexKeys
-                .Ascending(p => p.StudentId)
-                .Descending(p => p.PaymentDate);
-            _paymentCollection.Indexes.CreateOne(new CreateIndexModel<FeePayment>(paymentStudentKeys));
-        }
-        catch (Exception ex)
-        {
-            _isMongoDbActive = false;
-            _structureCollection = null;
-            _recordCollection = null;
-            _paymentCollection = null;
-            _logger.LogWarning(ex, "MongoDB unavailable for FeeService. Using resilient in-memory storage.");
+                // 4. Payment student index
+                var paymentStudentKeys = Builders<FeePayment>.IndexKeys
+                    .Ascending(p => p.StudentId)
+                    .Descending(p => p.PaymentDate);
+                _paymentCollection.Indexes.CreateOne(new CreateIndexModel<FeePayment>(paymentStudentKeys));
+            }
+            catch (Exception ex)
+            {
+                _isMongoDbActive = false;
+                _structureCollection = null;
+                _recordCollection = null;
+                _paymentCollection = null;
+                _logger.LogWarning(ex, "Error initializing Fee collections/indexes in MongoDB. Using resilient in-memory storage.");
+            }
         }
 
         // Initialize default fee structures and demo seed data
         InitializeFeeDataAsync().GetAwaiter().GetResult();
     }
 
+
     private async Task InitializeFeeDataAsync()
     {
+        if (!_allowInMemoryFallback && !_isMongoDbActive)
+        {
+            _logger.LogWarning("MongoDB is not active and in-memory fallback is disabled in this environment. In-memory demo fee data will not be initialized.");
+            return;
+        }
+
         try
         {
             // Default program fee structures

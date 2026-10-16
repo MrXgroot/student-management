@@ -1,3 +1,4 @@
+using EduCore.Api.Data;
 using EduCore.Api.Models;
 using EduCore.Api.Services;
 using Microsoft.Extensions.Configuration;
@@ -12,17 +13,14 @@ public class AcademicServiceTests
 
     public AcademicServiceTests()
     {
-        var myConfiguration = new Dictionary<string, string?>
+        var context = new MongoDbContext(new MongoDbOptions
         {
-            {"ConnectionStrings:MongoDb", "mongodb://localhost:27017"},
-            {"DatabaseName", "educore_mvp_test"}
-        };
+            ConnectionString = "",
+            DatabaseName = "educore_mvp_test",
+            AllowInMemoryFallback = true
+        }, NullLogger<MongoDbContext>.Instance);
 
-        var configuration = new ConfigurationBuilder()
-            .AddInMemoryCollection(myConfiguration)
-            .Build();
-
-        _service = new AcademicService(configuration, NullLogger<AcademicService>.Instance);
+        _service = new AcademicService(context, NullLogger<AcademicService>.Instance);
     }
 
     [Fact]

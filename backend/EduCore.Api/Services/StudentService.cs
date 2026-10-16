@@ -1,5 +1,8 @@
 using System.Collections.Concurrent;
+using EduCore.Api.Data;
 using EduCore.Api.Models;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging.Abstractions;
 using MongoDB.Bson;
 using MongoDB.Driver;
 
@@ -10,44 +13,41 @@ public class StudentService : IStudentService
     private readonly ILogger<StudentService> _logger;
     private readonly IMongoCollection<Student>? _collection;
     private readonly ConcurrentDictionary<string, Student> _inMemoryStore = new();
+    private readonly bool _allowInMemoryFallback;
     private bool _isMongoDbActive;
     private int _sequenceCounter = 1000;
 
     public bool IsMongoDbActive => _isMongoDbActive;
 
-    public StudentService(IConfiguration config, ILogger<StudentService> logger)
+    [ActivatorUtilitiesConstructor]
+    public StudentService(IMongoDbContext dbContext, ILogger<StudentService> logger)
     {
         _logger = logger;
-        var connectionString = config.GetConnectionString("MongoDb") ?? "mongodb://localhost:27017";
-        var databaseName = config["DatabaseName"] ?? "educore_mvp";
+        _isMongoDbActive = dbContext.IsAvailable;
+        _allowInMemoryFallback = dbContext.AllowInMemoryFallback;
 
-        try
+        if (_isMongoDbActive && dbContext.Database != null)
         {
-            var settings = MongoClientSettings.FromConnectionString(connectionString);
-            settings.ServerSelectionTimeout = TimeSpan.FromSeconds(2);
-            var client = new MongoClient(settings);
-            var database = client.GetDatabase(databaseName);
-            _collection = database.GetCollection<Student>("students");
+            try
+            {
+                _collection = dbContext.GetCollection<Student>("students");
 
-            // Test connectivity with a ping
-            database.RunCommandAsync((Command<BsonDocument>)"{ping:1}").Wait(2500);
-            _isMongoDbActive = true;
-            _logger.LogInformation("Connected successfully to MongoDB at {ConnectionString}, Database: {Db}", connectionString, databaseName);
-
-            // Ensure unique index on admissionNumber
-            var indexKeys = Builders<Student>.IndexKeys.Ascending(s => s.AdmissionNumber);
-            var indexOptions = new CreateIndexOptions { Unique = true, Sparse = false };
-            _collection.Indexes.CreateOne(new CreateIndexModel<Student>(indexKeys, indexOptions));
-        }
-        catch (Exception ex)
-        {
-            _isMongoDbActive = false;
-            _collection = null;
-            _logger.LogWarning(ex, "MongoDB is unavailable. Defaulting to In-Memory resilient fallback storage.");
+                // Ensure unique index on admissionNumber
+                var indexKeys = Builders<Student>.IndexKeys.Ascending(s => s.AdmissionNumber);
+                var indexOptions = new CreateIndexOptions { Unique = true, Sparse = false };
+                _collection.Indexes.CreateOne(new CreateIndexModel<Student>(indexKeys, indexOptions));
+            }
+            catch (Exception ex)
+            {
+                _isMongoDbActive = false;
+                _collection = null;
+                _logger.LogWarning(ex, "Error initializing Student collection/indexes in MongoDB. Defaulting to In-Memory resilient fallback storage.");
+            }
         }
 
         InitializeDemoData();
     }
+
 
     private void InitializeDemoData()
     {
@@ -77,6 +77,12 @@ public class StudentService : IStudentService
             }
         }
 
+        if (!_allowInMemoryFallback)
+        {
+            _logger.LogWarning("MongoDB is not active and in-memory fallback is disabled in this environment. In-memory demo students will not be initialized.");
+            return;
+        }
+
         // Fallback or mirror in memory
         _inMemoryStore.Clear();
         foreach (var s in seeds)
@@ -87,8 +93,18 @@ public class StudentService : IStudentService
         _logger.LogInformation("Initialized {Count} demo student records in In-Memory store.", seeds.Count);
     }
 
+    private void EnsurePersistenceAvailable()
+    {
+        if (!_isMongoDbActive && !_allowInMemoryFallback)
+        {
+            throw new InvalidOperationException("MongoDB persistence is unavailable and in-memory fallback is disabled in this environment.");
+        }
+    }
+
     public async Task<List<Student>> GetStudentsAsync(string? search, string? status, string? program)
     {
+        EnsurePersistenceAvailable();
+
         if (_isMongoDbActive && _collection != null)
         {
             try
@@ -123,6 +139,11 @@ public class StudentService : IStudentService
             }
             catch (Exception ex)
             {
+                if (!_allowInMemoryFallback)
+                {
+                    _logger.LogError(ex, "MongoDB read query failed and in-memory fallback is disabled in Production.");
+                    throw;
+                }
                 _logger.LogWarning(ex, "MongoDB read query failed. Reading from in-memory fallback.");
             }
         }
@@ -156,6 +177,8 @@ public class StudentService : IStudentService
 
     public async Task<Student?> GetStudentByIdAsync(string id)
     {
+        EnsurePersistenceAvailable();
+
         if (_isMongoDbActive && _collection != null)
         {
             try
@@ -165,6 +188,11 @@ public class StudentService : IStudentService
             }
             catch (Exception ex)
             {
+                if (!_allowInMemoryFallback)
+                {
+                    _logger.LogError(ex, "MongoDB lookup for {Id} failed and in-memory fallback is disabled in Production.", id);
+                    throw;
+                }
                 _logger.LogWarning(ex, "MongoDB lookup for {Id} failed.", id);
             }
         }
@@ -175,6 +203,8 @@ public class StudentService : IStudentService
 
     public async Task<Student> CreateStudentAsync(CreateStudentDto dto)
     {
+        EnsurePersistenceAvailable();
+
         var seq = Interlocked.Increment(ref _sequenceCounter);
         var currentYear = DateTime.UtcNow.Year;
         var admissionNumber = $"ADM-{currentYear}-{seq:D5}";
@@ -220,6 +250,11 @@ public class StudentService : IStudentService
             }
             catch (Exception ex)
             {
+                if (!_allowInMemoryFallback)
+                {
+                    _logger.LogError(ex, "MongoDB write failed for student {AdmissionNumber} and in-memory fallback is disabled in Production.", student.AdmissionNumber);
+                    throw;
+                }
                 _logger.LogWarning(ex, "MongoDB write failed. Storing student in in-memory fallback.");
             }
         }
@@ -230,6 +265,8 @@ public class StudentService : IStudentService
 
     public async Task<Student?> UpdateStudentAsync(string id, UpdateStudentDto dto)
     {
+        EnsurePersistenceAvailable();
+
         var existing = await GetStudentByIdAsync(id);
         if (existing == null) return null;
 
@@ -259,6 +296,11 @@ public class StudentService : IStudentService
             }
             catch (Exception ex)
             {
+                if (!_allowInMemoryFallback)
+                {
+                    _logger.LogError(ex, "MongoDB update failed for student {Id} and in-memory fallback is disabled in Production.", id);
+                    throw;
+                }
                 _logger.LogWarning(ex, "MongoDB update failed for {Id}.", id);
             }
         }
@@ -269,6 +311,8 @@ public class StudentService : IStudentService
 
     public async Task<bool> DeleteStudentAsync(string id)
     {
+        EnsurePersistenceAvailable();
+
         if (_isMongoDbActive && _collection != null)
         {
             try
@@ -279,6 +323,11 @@ public class StudentService : IStudentService
             }
             catch (Exception ex)
             {
+                if (!_allowInMemoryFallback)
+                {
+                    _logger.LogError(ex, "MongoDB delete failed for student {Id} and in-memory fallback is disabled in Production.", id);
+                    throw;
+                }
                 _logger.LogWarning(ex, "MongoDB delete failed for {Id}.", id);
             }
         }

@@ -31,7 +31,7 @@ public class DashboardController : ControllerBase
             institution = "Vidyadeep Institute of Technology, Bengaluru",
             timestamp = DateTime.UtcNow,
             isUsingMongoDb = _studentService.IsMongoDbActive,
-            persistenceMode = _studentService.IsMongoDbActive ? "MongoDB Server (Local)" : "Resilient In-Memory Fallback"
+            persistenceMode = _studentService.IsMongoDbActive ? "MongoDB" : "Resilient In-Memory Fallback"
         });
     }
 }

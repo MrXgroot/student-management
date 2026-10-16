@@ -68,6 +68,8 @@ EduCore backend is organized into 4 projects in `backend/EduCore.sln` plus 2 tes
 ### 4.1 Single-Node Replica Set (`rs0`) Requirement
 To guarantee financial ledger integrity and atomic admissions, EduCore mandates that development, testing, and production environments run MongoDB as a **single-node replica set** (or multi-node cluster), named `rs0`. This enables full multi-document ACID transactions via `IClientSession.StartTransaction()`.
 
+For centralized options, connection management, environment variable mapping, and cloud deployment guides, see [`docs/deployment/mongodb-configuration.md`](file:///d:/production/arise-craft/EduCore/docs/deployment/mongodb-configuration.md).
+
 ### 4.2 Aggregate Consolidation vs. Transactions
 1. **Single-Document Atomicity (Preferred):**
    - **Payment Allocations & Receipt:** Embedded in `payments` aggregate. Single-document insert records payment, receipt number, and allocations atomically.

@@ -1,5 +1,8 @@
 using System.Collections.Concurrent;
+using EduCore.Api.Data;
 using EduCore.Api.Models;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging.Abstractions;
 using MongoDB.Bson;
 using MongoDB.Driver;
 
@@ -15,53 +18,50 @@ public class AcademicService : IAcademicService
     private readonly ConcurrentDictionary<string, ProgramInfo> _inMemoryPrograms = new();
     private readonly ConcurrentDictionary<string, AcademicPeriod> _inMemoryPeriods = new();
     private readonly ConcurrentDictionary<string, Course> _inMemoryCourses = new();
-
+    private readonly bool _allowInMemoryFallback;
     private bool _isMongoDbActive;
 
     public bool IsMongoDbActive => _isMongoDbActive;
 
-    public AcademicService(IConfiguration config, ILogger<AcademicService> logger)
+    [ActivatorUtilitiesConstructor]
+    public AcademicService(IMongoDbContext dbContext, ILogger<AcademicService> logger)
     {
         _logger = logger;
-        var connectionString = config.GetConnectionString("MongoDb") ?? "mongodb://localhost:27017";
-        var databaseName = config["DatabaseName"] ?? "educore_mvp";
+        _isMongoDbActive = dbContext.IsAvailable;
+        _allowInMemoryFallback = dbContext.AllowInMemoryFallback;
 
-        try
+        if (_isMongoDbActive && dbContext.Database != null)
         {
-            var settings = MongoClientSettings.FromConnectionString(connectionString);
-            settings.ServerSelectionTimeout = TimeSpan.FromSeconds(2);
-            var client = new MongoClient(settings);
-            var database = client.GetDatabase(databaseName);
+            try
+            {
+                _programsCollection = dbContext.GetCollection<ProgramInfo>("programs");
+                _periodsCollection = dbContext.GetCollection<AcademicPeriod>("academicPeriods");
+                _coursesCollection = dbContext.GetCollection<Course>("courses");
 
-            _programsCollection = database.GetCollection<ProgramInfo>("programs");
-            _periodsCollection = database.GetCollection<AcademicPeriod>("academicPeriods");
-            _coursesCollection = database.GetCollection<Course>("courses");
+                // Create indexes
+                var progIndex = Builders<ProgramInfo>.IndexKeys.Ascending(p => p.Code);
+                _programsCollection.Indexes.CreateOne(new CreateIndexModel<ProgramInfo>(progIndex, new CreateIndexOptions { Unique = true }));
 
-            database.RunCommandAsync((Command<BsonDocument>)"{ping:1}").Wait(2500);
-            _isMongoDbActive = true;
-            _logger.LogInformation("AcademicService connected to MongoDB at {Conn}, Db: {Db}", connectionString, databaseName);
+                var courseCodeIndex = Builders<Course>.IndexKeys.Ascending(c => c.Code);
+                _coursesCollection.Indexes.CreateOne(new CreateIndexModel<Course>(courseCodeIndex, new CreateIndexOptions { Unique = true }));
 
-            // Create indexes
-            var progIndex = Builders<ProgramInfo>.IndexKeys.Ascending(p => p.Code);
-            _programsCollection.Indexes.CreateOne(new CreateIndexModel<ProgramInfo>(progIndex, new CreateIndexOptions { Unique = true }));
-
-            var courseCodeIndex = Builders<Course>.IndexKeys.Ascending(c => c.Code);
-            _coursesCollection.Indexes.CreateOne(new CreateIndexModel<Course>(courseCodeIndex, new CreateIndexOptions { Unique = true }));
-
-            var courseProgSemIndex = Builders<Course>.IndexKeys.Ascending(c => c.ProgramCode).Ascending(c => c.Semester);
-            _coursesCollection.Indexes.CreateOne(new CreateIndexModel<Course>(courseProgSemIndex));
-        }
-        catch (Exception ex)
-        {
-            _isMongoDbActive = false;
-            _programsCollection = null;
-            _periodsCollection = null;
-            _coursesCollection = null;
-            _logger.LogWarning(ex, "MongoDB unavailable for AcademicService. Using resilient in-memory storage.");
+                var courseProgSemIndex = Builders<Course>.IndexKeys.Ascending(c => c.ProgramCode).Ascending(c => c.Semester);
+                _coursesCollection.Indexes.CreateOne(new CreateIndexModel<Course>(courseProgSemIndex));
+            }
+            catch (Exception ex)
+            {
+                _isMongoDbActive = false;
+                _programsCollection = null;
+                _periodsCollection = null;
+                _coursesCollection = null;
+                _logger.LogWarning(ex, "Error initializing Academic collections/indexes in MongoDB. Using resilient in-memory storage.");
+            }
         }
 
         InitializeSeeds();
     }
+
+
 
     private void InitializeSeeds()
     {
@@ -110,6 +110,12 @@ public class AcademicService : IAcademicService
             }
         }
 
+        if (!_allowInMemoryFallback)
+        {
+            _logger.LogWarning("MongoDB is not active and in-memory fallback is disabled in this environment. In-memory academic seeds will not be initialized.");
+            return;
+        }
+
         _inMemoryPrograms.Clear();
         foreach (var p in seedPrograms) _inMemoryPrograms[p.Id] = p;
 
@@ -120,8 +126,18 @@ public class AcademicService : IAcademicService
         foreach (var c in seedCourses) _inMemoryCourses[c.Id] = c;
     }
 
+    private void EnsurePersistenceAvailable()
+    {
+        if (!_isMongoDbActive && !_allowInMemoryFallback)
+        {
+            throw new InvalidOperationException("MongoDB persistence is unavailable and in-memory fallback is disabled in this environment.");
+        }
+    }
+
     public async Task<List<ProgramInfo>> GetProgramsAsync()
     {
+        EnsurePersistenceAvailable();
+
         if (_isMongoDbActive && _programsCollection != null)
         {
             try
@@ -130,6 +146,11 @@ public class AcademicService : IAcademicService
             }
             catch (Exception ex)
             {
+                if (!_allowInMemoryFallback)
+                {
+                    _logger.LogError(ex, "MongoDB read failed for programs and in-memory fallback is disabled in Production.");
+                    throw;
+                }
                 _logger.LogWarning(ex, "MongoDB read failed for programs. Using in-memory fallback.");
             }
         }
@@ -156,6 +177,8 @@ public class AcademicService : IAcademicService
 
     public async Task<List<AcademicPeriod>> GetAcademicPeriodsAsync()
     {
+        EnsurePersistenceAvailable();
+
         if (_isMongoDbActive && _periodsCollection != null)
         {
             try
@@ -164,6 +187,11 @@ public class AcademicService : IAcademicService
             }
             catch (Exception ex)
             {
+                if (!_allowInMemoryFallback)
+                {
+                    _logger.LogError(ex, "MongoDB read failed for academic periods and in-memory fallback is disabled in Production.");
+                    throw;
+                }
                 _logger.LogWarning(ex, "MongoDB read failed for academic periods. Using in-memory fallback.");
             }
         }
@@ -179,6 +207,8 @@ public class AcademicService : IAcademicService
 
     public async Task<List<Course>> GetCoursesAsync(string? search, string? program, int? semester, string? status)
     {
+        EnsurePersistenceAvailable();
+
         if (_isMongoDbActive && _coursesCollection != null)
         {
             try
@@ -219,6 +249,11 @@ public class AcademicService : IAcademicService
             }
             catch (Exception ex)
             {
+                if (!_allowInMemoryFallback)
+                {
+                    _logger.LogError(ex, "MongoDB read failed for courses and in-memory fallback is disabled in Production.");
+                    throw;
+                }
                 _logger.LogWarning(ex, "MongoDB read failed for courses. Using in-memory fallback.");
             }
         }

@@ -1,3 +1,4 @@
+using EduCore.Api.Data;
 using EduCore.Api.Models;
 using EduCore.Api.Services;
 using Microsoft.Extensions.Configuration;
@@ -14,19 +15,16 @@ public class FeeServiceTests
 
     public FeeServiceTests()
     {
-        var testConfig = new Dictionary<string, string?>
+        var context = new MongoDbContext(new MongoDbOptions
         {
-            {"ConnectionStrings:MongoDb", "mongodb://localhost:27017"},
-            {"DatabaseName", "educore_mvp_test"}
-        };
+            ConnectionString = "",
+            DatabaseName = "educore_mvp_test",
+            AllowInMemoryFallback = true
+        }, NullLogger<MongoDbContext>.Instance);
 
-        var config = new ConfigurationBuilder()
-            .AddInMemoryCollection(testConfig)
-            .Build();
-
-        _studentService = new StudentService(config, NullLogger<StudentService>.Instance);
-        _academicService = new AcademicService(config, NullLogger<AcademicService>.Instance);
-        _feeService = new FeeService(config, _studentService, _academicService, NullLogger<FeeService>.Instance);
+        _studentService = new StudentService(context, NullLogger<StudentService>.Instance);
+        _academicService = new AcademicService(context, NullLogger<AcademicService>.Instance);
+        _feeService = new FeeService(context, _studentService, _academicService, NullLogger<FeeService>.Instance);
     }
 
     private async Task<Student> CreateTestStudentAsync(string program = "BCA", int semester = 1)

@@ -1,5 +1,8 @@
 using System.Collections.Concurrent;
+using EduCore.Api.Data;
 using EduCore.Api.Models;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging.Abstractions;
 using MongoDB.Bson;
 using MongoDB.Driver;
 
@@ -14,12 +17,14 @@ public class AttendanceService : IAttendanceService
 
     private readonly IMongoCollection<AttendanceRecord>? _collection;
     private readonly ConcurrentDictionary<string, AttendanceRecord> _inMemoryRecords = new();
+    private readonly bool _allowInMemoryFallback;
     private bool _isMongoDbActive;
 
     public bool IsMongoDbActive => _isMongoDbActive;
 
+    [ActivatorUtilitiesConstructor]
     public AttendanceService(
-        IConfiguration config,
+        IMongoDbContext dbContext,
         IStudentService studentService,
         IAcademicService academicService,
         ITermRegistrationService registrationService,
@@ -29,57 +34,57 @@ public class AttendanceService : IAttendanceService
         _studentService = studentService;
         _academicService = academicService;
         _registrationService = registrationService;
+        _isMongoDbActive = dbContext.IsAvailable;
+        _allowInMemoryFallback = dbContext.AllowInMemoryFallback;
 
-        var connectionString = config.GetConnectionString("MongoDb") ?? "mongodb://localhost:27017";
-        var databaseName = config["DatabaseName"] ?? "educore_mvp";
-
-        try
+        if (_isMongoDbActive && dbContext.Database != null)
         {
-            var settings = MongoClientSettings.FromConnectionString(connectionString);
-            settings.ServerSelectionTimeout = TimeSpan.FromSeconds(2);
-            var client = new MongoClient(settings);
-            var database = client.GetDatabase(databaseName);
-
-            _collection = database.GetCollection<AttendanceRecord>("attendanceRecords");
-
-            database.RunCommandAsync((Command<BsonDocument>)"{ping:1}").Wait(2500);
-            _isMongoDbActive = true;
-            _logger.LogInformation("AttendanceService connected to MongoDB at {Conn}, Database: {Db}", connectionString, databaseName);
-
-            // Create Unique Compound Index: { StudentId: 1, CourseId: 1, ClassDate: 1 }
-            var indexKeys = Builders<AttendanceRecord>.IndexKeys
-                .Ascending(r => r.StudentId)
-                .Ascending(r => r.CourseId)
-                .Ascending(r => r.ClassDate);
-
-            _collection.Indexes.CreateOne(new CreateIndexModel<AttendanceRecord>(indexKeys, new CreateIndexOptions
+            try
             {
-                Name = "idx_attendance_student_course_date_unique",
-                Unique = true
-            }));
+                _collection = dbContext.GetCollection<AttendanceRecord>("attendanceRecords");
 
-            // Secondary Index for efficient date/course queries
-            var courseDateKeys = Builders<AttendanceRecord>.IndexKeys
-                .Ascending(r => r.CourseId)
-                .Ascending(r => r.ClassDate);
-            _collection.Indexes.CreateOne(new CreateIndexModel<AttendanceRecord>(courseDateKeys, new CreateIndexOptions
+                // Create Unique Compound Index: { StudentId: 1, CourseId: 1, ClassDate: 1 }
+                var indexKeys = Builders<AttendanceRecord>.IndexKeys
+                    .Ascending(r => r.StudentId)
+                    .Ascending(r => r.CourseId)
+                    .Ascending(r => r.ClassDate);
+
+                _collection.Indexes.CreateOne(new CreateIndexModel<AttendanceRecord>(indexKeys, new CreateIndexOptions
+                {
+                    Name = "idx_attendance_student_course_date_unique",
+                    Unique = true
+                }));
+
+                // Secondary Index for efficient date/course queries
+                var courseDateKeys = Builders<AttendanceRecord>.IndexKeys
+                    .Ascending(r => r.CourseId)
+                    .Ascending(r => r.ClassDate);
+                _collection.Indexes.CreateOne(new CreateIndexModel<AttendanceRecord>(courseDateKeys, new CreateIndexOptions
+                {
+                    Name = "idx_attendance_course_date"
+                }));
+            }
+            catch (Exception ex)
             {
-                Name = "idx_attendance_course_date"
-            }));
-        }
-        catch (Exception ex)
-        {
-            _isMongoDbActive = false;
-            _collection = null;
-            _logger.LogWarning(ex, "MongoDB unavailable for AttendanceService. Using resilient in-memory storage.");
+                _isMongoDbActive = false;
+                _collection = null;
+                _logger.LogWarning(ex, "Error initializing Attendance collection/indexes in MongoDB. Using resilient in-memory storage.");
+            }
         }
 
         // Initialize demo enrollments and seed attendance record if needed
         InitializeDemoAttendanceAsync().GetAwaiter().GetResult();
     }
 
+
     private async Task InitializeDemoAttendanceAsync()
     {
+        if (!_allowInMemoryFallback && !_isMongoDbActive)
+        {
+            _logger.LogWarning("MongoDB is not active and in-memory fallback is disabled in this environment. In-memory demo attendance will not be initialized.");
+            return;
+        }
+
         try
         {
             var courses = await _academicService.GetCoursesAsync();
